@@ -22,6 +22,7 @@ import os
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 import folium
@@ -124,34 +125,101 @@ def build_advisory_prompt(context: dict) -> str:
     )
 
 
+def _secret(name: str, default: str = "") -> str:
+    """Read a config value from the environment first, then ``st.secrets``."""
+    val = os.environ.get(name, "")
+    if not val:
+        try:
+            val = st.secrets.get(name, default)
+        except Exception:
+            val = default
+    return val or default
+
+
 def generate_ai_advisory(prompt: str) -> str:
     """
     Connect to an LLM API client and return a 3-bullet disaster advisory.
 
-    Uses the Anthropic Messages API when ``ANTHROPIC_API_KEY`` is available
-    (env var or ``st.secrets``); otherwise returns a deterministic offline
-    template so the app stays usable without network / keys.
-    """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        try:
-            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-        except Exception:
-            api_key = ""
+    Provider is auto-detected from whichever key is configured (env var or
+    ``st.secrets``):
 
-    if api_key:
+    * ``OPENROUTER_API_KEY``  -> OpenRouter (OpenAI-compatible chat completions)
+    * ``ANTHROPIC_API_KEY``   -> Anthropic Messages API
+    * ``OPENAI_API_KEY`` (+ optional ``OPENAI_BASE_URL``) -> OpenAI-compatible
+
+    With no key configured a deterministic offline template is returned so the
+    app stays usable without network / credentials.
+    """
+    system = "You are a careful glacial-hazard emergency-management advisor."
+
+    or_key = _secret("OPENROUTER_API_KEY")
+    if or_key:
+        model = _secret("LLM_MODEL", "anthropic/claude-sonnet-5")
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {or_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/ntadepalli2/aiglaceiermodelpredicton",
+                    "X-Title": "Global GLOF Risk Assessment",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 500,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+                timeout=45,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as exc:  # noqa: BLE001
+            return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
+                    + _offline_advisory())
+
+    ant_key = _secret("ANTHROPIC_API_KEY")
+    if ant_key:
         try:
             import anthropic
 
-            client = anthropic.Anthropic(api_key=api_key)
+            client = anthropic.Anthropic(api_key=ant_key)
             msg = client.messages.create(
-                model="claude-sonnet-5",
+                model=_secret("LLM_MODEL", "claude-sonnet-5"),
                 max_tokens=500,
+                system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return "".join(block.text for block in msg.content if block.type == "text")
+            return "".join(b.text for b in msg.content if b.type == "text").strip()
         except Exception as exc:  # noqa: BLE001
-            return f"_LLM request failed ({exc}). Showing offline guidance._\n\n" + _offline_advisory()
+            return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
+                    + _offline_advisory())
+
+    oai_key = _secret("OPENAI_API_KEY")
+    if oai_key:
+        base = _secret("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        try:
+            resp = requests.post(
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {oai_key}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": _secret("LLM_MODEL", "gpt-4o-mini"),
+                    "max_tokens": 500,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+                timeout=45,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as exc:  # noqa: BLE001
+            return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
+                    + _offline_advisory())
 
     return _offline_advisory()
 
@@ -204,7 +272,7 @@ radius_km = st.sidebar.slider("Search radius (km)", 5, 300, 50, 5)
 
 st.sidebar.caption(
     "Data: Zenodo Global GLOF Database · GLIMS Glacier Database · Copernicus GLO-30 DEM. "
-    "Set `ANTHROPIC_API_KEY` to enable live AI advisories."
+    "Set `OPENROUTER_API_KEY` (or `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) to enable live AI advisories."
 )
 
 # --------------------------------------------------------------------------- #
@@ -407,6 +475,6 @@ with tab_ai:
 
     st.caption(
         "Advisories are decision-support only and must be validated against official "
-        "national disaster-management guidance. Without `ANTHROPIC_API_KEY` a built-in "
+        "national disaster-management guidance. Without an LLM API key a built-in "
         "offline template is shown."
     )

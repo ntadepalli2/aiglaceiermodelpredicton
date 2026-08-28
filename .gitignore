@@ -4,5 +4,6 @@ __pycache__/
 venv/
 .env
 .streamlit/secrets.toml
+.claude/
 data/global_glacial_lakes.csv
 .DS_Store
