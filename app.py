@@ -136,6 +136,33 @@ def _secret(name: str, default: str = "") -> str:
     return val or default
 
 
+SYSTEM_PROMPT = "You are a careful glacial-hazard emergency-management advisor."
+
+
+def _chat_completion(base_url: str, api_key: str, model: str, prompt: str,
+                     extra_headers: dict | None = None) -> str:
+    """POST to any OpenAI-compatible /chat/completions endpoint and return the text."""
+    payload = {
+        "model": model,
+        "max_tokens": int(_secret("LLM_MAX_TOKENS", "800") or 800),
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    effort = _secret("LLM_REASONING_EFFORT")  # e.g. "low" for gpt-oss / o-series
+    if effort:
+        payload["reasoning_effort"] = effort
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers.update(extra_headers or {})
+
+    resp = requests.post(f"{base_url.rstrip('/')}/chat/completions",
+                         headers=headers, json=payload, timeout=45)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 def generate_ai_advisory(prompt: str) -> str:
     """
     Connect to an LLM API client and return a 3-bullet disaster advisory.
@@ -145,81 +172,49 @@ def generate_ai_advisory(prompt: str) -> str:
 
     * ``OPENROUTER_API_KEY``  -> OpenRouter (OpenAI-compatible chat completions)
     * ``ANTHROPIC_API_KEY``   -> Anthropic Messages API
-    * ``OPENAI_API_KEY`` (+ optional ``OPENAI_BASE_URL``) -> OpenAI-compatible
+    * ``OPENAI_API_KEY`` (+ optional ``OPENAI_BASE_URL``) -> any OpenAI-compatible
+      endpoint (OpenAI, Groq, Google Gemini, Cerebras, Mistral, ...)
+
+    Optional tuning secrets: ``LLM_MODEL``, ``LLM_MAX_TOKENS``,
+    ``LLM_REASONING_EFFORT``.
 
     With no key configured a deterministic offline template is returned so the
     app stays usable without network / credentials.
     """
-    system = "You are a careful glacial-hazard emergency-management advisor."
-
-    or_key = _secret("OPENROUTER_API_KEY")
-    if or_key:
-        model = _secret("LLM_MODEL", "anthropic/claude-sonnet-5")
-        try:
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {or_key}",
-                    "Content-Type": "application/json",
+    try:
+        or_key = _secret("OPENROUTER_API_KEY")
+        if or_key:
+            return _chat_completion(
+                "https://openrouter.ai/api/v1", or_key,
+                _secret("LLM_MODEL", "anthropic/claude-sonnet-5"), prompt,
+                extra_headers={
                     "HTTP-Referer": "https://github.com/ntadepalli2/aiglaceiermodelpredicton",
                     "X-Title": "Global GLOF Risk Assessment",
                 },
-                json={
-                    "model": model,
-                    "max_tokens": 500,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-                timeout=45,
             )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception as exc:  # noqa: BLE001
-            return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
-                    + _offline_advisory())
 
-    ant_key = _secret("ANTHROPIC_API_KEY")
-    if ant_key:
-        try:
+        ant_key = _secret("ANTHROPIC_API_KEY")
+        if ant_key:
             import anthropic
 
             client = anthropic.Anthropic(api_key=ant_key)
             msg = client.messages.create(
                 model=_secret("LLM_MODEL", "claude-sonnet-5"),
-                max_tokens=500,
-                system=system,
+                max_tokens=int(_secret("LLM_MAX_TOKENS", "800") or 800),
+                system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
             return "".join(b.text for b in msg.content if b.type == "text").strip()
-        except Exception as exc:  # noqa: BLE001
-            return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
-                    + _offline_advisory())
 
-    oai_key = _secret("OPENAI_API_KEY")
-    if oai_key:
-        base = _secret("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        try:
-            resp = requests.post(
-                f"{base}/chat/completions",
-                headers={"Authorization": f"Bearer {oai_key}",
-                         "Content-Type": "application/json"},
-                json={
-                    "model": _secret("LLM_MODEL", "gpt-4o-mini"),
-                    "max_tokens": 500,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-                timeout=45,
+        oai_key = _secret("OPENAI_API_KEY")
+        if oai_key:
+            return _chat_completion(
+                _secret("OPENAI_BASE_URL", "https://api.openai.com/v1"), oai_key,
+                _secret("LLM_MODEL", "gpt-4o-mini"), prompt,
             )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception as exc:  # noqa: BLE001
-            return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
-                    + _offline_advisory())
+    except Exception as exc:  # noqa: BLE001
+        return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
+                + _offline_advisory())
 
     return _offline_advisory()
 
