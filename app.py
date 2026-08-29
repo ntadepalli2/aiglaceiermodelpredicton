@@ -317,12 +317,24 @@ with tab_map:
         max_markers = st.slider("Max markers", 200, 5000, 1500, 100)
 
     with c1:
+        # Keyless light basemap. CARTO "positron" and Stamen now require an API
+        # key ("API KEY REQUIRED" is watermarked onto their tiles), so use
+        # Esri's free World Light Gray Base, with OpenStreetMap as a fallback.
         fmap = folium.Map(
             location=[default_lat, default_lon],
             zoom_start=default_zoom,
-            tiles="CartoDB positron",
+            tiles=None,
             world_copy_jump=True,
         )
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/"
+                  "World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+            attr="Tiles © Esri — Esri, DeLorme, NAVTEQ",
+            name="Light gray",
+            max_zoom=16,
+            control=True,
+        ).add_to(fmap)
+        folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=True).add_to(fmap)
 
         view = inventory[inventory["volume_class"].isin(vol_filter)]
         # Prioritise lakes near the current location, then cap for performance.
