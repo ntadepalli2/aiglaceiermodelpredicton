@@ -373,13 +373,17 @@ with tab_map:
 
     with c2:
         st.subheader("Location metrics")
-        st.metric("Nearest Glacial Basin", assessment["nearest_basin"],
-                  f'{assessment["basin_distance_km"]} km')
+        st.metric("Nearest documented GLOF",
+                  f'{assessment["nearest_lake_distance_km"]:,g} km',
+                  assessment["nearest_basin"], delta_color="off")
+        h_help = ("from nearest site above the location"
+                  if assessment.get("runout_from_site_above")
+                  else "no documented site above this location nearby")
         st.metric("Elevation Drop (H)", f'{assessment["elevation_drop_H_m"]} m',
-                  f'runout L {assessment["nearest_lake_distance_km"]} km')
+                  h_help, delta_color="off")
         st.metric("Global Risk Level",
                   f'{RISK_COLOR.get(assessment["risk_score"], "")} {assessment["risk_score"]}',
-                  f'H/L {assessment["runout_ratio_HL"]}')
+                  f'H/L {assessment["runout_ratio_HL"]}', delta_color="off")
         st.metric("Documented sites within radius", assessment["lakes_within_radius"])
 
         q_filter = st.multiselect(
@@ -491,8 +495,8 @@ with tab_map:
     st.caption(
         "Each marker is a **documented** historical outburst site (Zenodo GLOF "
         "Database V3.0). Colour = reported peak discharge; grey = magnitude not "
-        "reported. Red dashed line = geodesic to the nearest documented site above "
-        "the selected location."
+        "reported. Red dashed line = geodesic to the nearest documented outburst "
+        "site."
     )
 
 # --------------------------------------------------------------------------- #

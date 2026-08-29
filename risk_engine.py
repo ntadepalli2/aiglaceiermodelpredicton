@@ -366,23 +366,32 @@ def nearest_basin(lat: float, lon: float):
 # --------------------------------------------------------------------------- #
 
 def _risk_category(hl_ratio: float, distance_m: float, peak_q: float) -> str:
-    """Combine runout ratio (H/L), proximity and breach discharge into a score."""
-    score = 0
+    """Combine proximity, runout ratio (H/L) and breach discharge into a score.
 
-    if hl_ratio >= 0.20:
-        score += 2
-    elif hl_ratio >= 0.10:
-        score += 1
+    Proximity gates everything: a documented outburst far away is not a local
+    risk no matter how large it was.
+    """
+    if distance_m > 60_000:
+        return "Low"
+
+    score = 0
 
     if distance_m <= 5_000:
         score += 2
     elif distance_m <= 20_000:
         score += 1
 
-    if np.isfinite(peak_q) and peak_q >= 5_000:
+    if hl_ratio >= 0.20:
         score += 2
-    elif np.isfinite(peak_q) and peak_q >= 1_000:
+    elif hl_ratio >= 0.10:
         score += 1
+
+    # Flood magnitude only matters if the flood could plausibly reach here.
+    if distance_m <= 30_000 and np.isfinite(peak_q):
+        if peak_q >= 5_000:
+            score += 2
+        elif peak_q >= 1_000:
+            score += 1
 
     if score >= 4:
         return "High"
@@ -425,10 +434,13 @@ def assess_global_location_risk(
         return {"risk_score": "Low", "error": "empty inventory"}
 
     # --- R-tree spatial index over site point geometries -------------------
+    # Query a generous buffer so we always have real neighbours to rank; fall
+    # back to the whole inventory only when nothing is anywhere near.
     tree = STRtree(list(gdf.geometry.values))
     user_pt = Point(user_lon, user_lat)
 
-    deg_buffer = (search_radius_km * 1000.0) / 111_320.0 * 1.3
+    query_km = max(search_radius_km, 400.0)
+    deg_buffer = (query_km * 1000.0) / 111_320.0 * 1.3
     idx = tree.query(user_pt.buffer(deg_buffer))
     if len(idx) == 0:
         idx = np.arange(len(gdf))
@@ -437,26 +449,41 @@ def assess_global_location_risk(
     cand["distance_m"] = haversine_m(
         user_lat, user_lon, cand["latitude"].values, cand["longitude"].values
     )
-    cand = cand.sort_values("distance_m")
+    cand = cand.sort_values("distance_m").reset_index(drop=True)
 
     within = cand[cand["distance_m"] <= search_radius_km * 1000.0]
     lakes_within_radius = int(len(within))
 
-    # Nearest site *above* the user (positive H), else nearest overall.
-    above = cand[cand["elevation_m"] > user_elevation]
-    nearest = above.iloc[0] if not above.empty else cand.iloc[0]
+    # The nearest documented site (any elevation) - used for the map line and
+    # the "nearest site" read-out.
+    nearest = cand.iloc[0]
 
-    nb_name, nb_dist, _ = nearest_basin(user_lat, user_lon)
+    # Runout geometry needs a site that sits ABOVE the location and is close
+    # enough that its flood could plausibly reach it. If there is no such site,
+    # there is no credible documented-GLOF runout path (H/L -> 0).
+    runout_cap_m = max(search_radius_km, 150.0) * 1000.0
+    runout_pool = cand[(cand["distance_m"] <= runout_cap_m)
+                       & (cand["elevation_m"] > user_elevation)]
+    runout = runout_pool.iloc[0] if not runout_pool.empty else None
 
-    L = float(max(nearest["distance_m"], 1.0))
-    H = float(max(nearest["elevation_m"] - user_elevation, 0.0))
+    if runout is not None:
+        L = float(max(runout["distance_m"], 1.0))
+        H = float(max(runout["elevation_m"] - user_elevation, 0.0))
+    else:
+        L = float(max(nearest["distance_m"], 1.0))
+        H = float(max(nearest["elevation_m"] - user_elevation, 0.0))
     hl = H / L
     peak_q = float(nearest["peak_discharge_m3s"]) if np.isfinite(nearest["peak_discharge_m3s"]) else np.nan
+    nearest_m = float(nearest["distance_m"])
+
+    # Nearest glaciated basin: the region label of the nearest documented site
+    # (data-driven and accurate), with the coarse centroid list as a fallback.
+    nb_name = str(nearest["region"]) if pd.notna(nearest.get("region")) else nearest_basin(user_lat, user_lon)[0]
 
     return {
-        "risk_score": _risk_category(hl, L, peak_q),
+        "risk_score": _risk_category(hl, nearest_m, peak_q),
         "nearest_basin": nb_name,
-        "basin_distance_km": round(nb_dist / 1000.0, 1),
+        "basin_distance_km": round(float(nearest["distance_m"]) / 1000.0, 1),
         "nearest_lake_id": str(nearest["lake_id"]),
         "nearest_lake_name": (None if pd.isna(nearest.get("lake_name")) else str(nearest.get("lake_name"))),
         "nearest_lake_country": str(nearest["country"]),
@@ -465,7 +492,8 @@ def assess_global_location_risk(
         "nearest_lake_last_outburst": (None if pd.isna(nearest.get("outburst_date")) else str(nearest.get("outburst_date"))),
         "nearest_lake_lat": float(nearest["latitude"]),
         "nearest_lake_lon": float(nearest["longitude"]),
-        "nearest_lake_distance_km": round(L / 1000.0, 2),
+        "nearest_lake_distance_km": round(float(nearest["distance_m"]) / 1000.0, 2),
+        "runout_from_site_above": runout is not None,
         "elevation_drop_H_m": round(H, 1),
         "runout_length_L_m": round(L, 1),
         "runout_ratio_HL": round(hl, 4),
