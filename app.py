@@ -92,41 +92,49 @@ def geocode(query: str):
     return None
 
 
+@st.cache_data(show_spinner="Scoring location against the global GLOF record…")
+def hazard_index(la: float, lo: float, el: float, rad: float) -> dict:
+    return re.location_hazard_index(la, lo, el, rad, gdf=re.load_global_glacier_data())
+
+
 # --------------------------------------------------------------------------- #
 # AI emergency-response module  (AI Safety Advisory tab)
 # --------------------------------------------------------------------------- #
 
 def build_advisory_prompt(context: dict) -> str:
     """
-    Construct an LLM prompt from the geographic risk context.
-
-    Parameters
-    ----------
-    context : dict with keys
-        country_region, nearest_glacier, runout_distance_km, risk_rating,
-        elevation_drop_m, peak_discharge_m3s, dam_type, last_outburst
+    Build the LLM prompt from the computed GLOF Hazard Index and its components.
     """
+    comps = context.get("components", {})
+    comp_lines = "\n".join(f"    - {k}: {v}/100" for k, v in comps.items())
     return (
         "You are an emergency-management advisor specialising in glacial lake "
-        "outburst floods (GLOFs).\n\n"
-        "Location context (nearest documented outburst site, Zenodo GLOF DB V3.0):\n"
-        f"- Country / region: {context.get('country_region', 'Unknown')}\n"
-        f"- Nearest glaciated basin: {context.get('nearest_glacier', 'Unknown')}\n"
-        f"- Distance to nearest documented GLOF site: "
-        f"{context.get('runout_distance_km', 'n/a')} km\n"
-        f"- Impounding-dam material at that site: {context.get('dam_type', 'unknown')}\n"
-        f"- Most recent recorded outburst there: {context.get('last_outburst', 'n/a')}\n"
-        f"- Elevation drop (H) from lake to site: "
-        f"{context.get('elevation_drop_m', 'n/a')} m\n"
-        f"- Peak breach discharge (reported or V-scaled): "
-        f"{context.get('peak_discharge_m3s', 'n/a')} m³/s\n"
-        f"- Computed risk rating: {context.get('risk_rating', 'Unknown')}\n\n"
-        "Produce EXACTLY three concise bullet points, tailored to this specific "
-        "mountain range's terrain and infrastructure, covering:\n"
-        "  1. Local warning signs residents and trekkers should watch for.\n"
-        "  2. Evacuation tactics and safe-ground guidance for this valley type.\n"
-        "  3. Infrastructure / preparedness actions for local authorities.\n"
-        "Keep each bullet under 40 words. Do not add a preamble or conclusion."
+        "outburst floods (GLOFs). A quantitative GLOF Hazard Index (0-100) has "
+        "already been computed for a specific location. Interpret it for the "
+        "reader - do not restate the numbers mechanically.\n\n"
+        f"Location / region: {context.get('country_region', 'Unknown')}\n"
+        f"Nearest glaciated basin: {context.get('nearest_glacier', 'Unknown')}\n"
+        f"GLOF Hazard Index: {context.get('hazard_index', 'n/a')}/100. "
+        f"This is the PRIMARY signal - tier: {context.get('hazard_tier', 'n/a')} "
+        f"(bands: 0-20 Minimal, 20-40 Low, 40-60 Moderate, 60-80 High, 80-100 Severe).\n"
+        f"For context only: the location's exposure exceeds {context.get('exposure_percentile', 'n/a')}% "
+        f"of the {context.get('inventory_size', 'n/a')} catalogued outburst sites "
+        f"(most sites sit in known hazard zones, so a normal town scores near 0% here - "
+        f"do NOT treat a low percentage as alarming, and do NOT invert it).\n"
+        f"Nearest documented outburst site: {context.get('runout_distance_km', 'n/a')} km away, "
+        f"dam material {context.get('dam_type', 'unknown')}, "
+        f"last recorded outburst {context.get('last_outburst', 'none on record')}\n"
+        f"Peak breach discharge (reported or scaled): "
+        f"{context.get('peak_discharge_m3s', 'n/a')} m3/s\n"
+        f"Index component scores:\n{comp_lines}\n\n"
+        "Write a location-specific advisory as EXACTLY three short paragraphs "
+        "(2-3 sentences each, no headings, no bullet points):\n"
+        "1. What this index and global ranking mean in plain language for someone "
+        "living in or travelling to this location.\n"
+        "2. The local warning signs that matter most here and the single most "
+        "important evacuation action for this terrain.\n"
+        "3. One preparedness priority for local authorities, tied to the "
+        "highest-scoring (worst) index component.\n"
     )
 
 
@@ -168,9 +176,9 @@ def _chat_completion(base_url: str, api_key: str, model: str, prompt: str,
     return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-def generate_ai_advisory(prompt: str) -> str:
+def generate_ai_advisory(prompt: str, context: dict | None = None) -> str:
     """
-    Connect to an LLM API client and return a 3-bullet disaster advisory.
+    Connect to an LLM API client and return the location advisory.
 
     Provider is auto-detected from whichever key is configured (env var or
     ``st.secrets``):
@@ -219,21 +227,32 @@ def generate_ai_advisory(prompt: str) -> str:
             )
     except Exception as exc:  # noqa: BLE001
         return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
-                + _offline_advisory())
+                + _offline_advisory(context))
 
-    return _offline_advisory()
+    return _offline_advisory(context)
 
 
-def _offline_advisory() -> str:
+def _offline_advisory(context: dict | None = None) -> str:
+    ctx = context or {}
+    tier = ctx.get("hazard_tier", "Moderate")
+    idx = ctx.get("hazard_index", "—")
+    pct = ctx.get("exposure_percentile", "—")
+    worst = max(ctx.get("components", {"—": 0}).items(), key=lambda kv: kv[1])[0]
     return (
-        "- **Warning signs:** sudden drop or surge in river level, unusually turbid or "
-        "debris-laden water, rumbling from upstream, fresh cracks or seepage on the moraine dam.\n"
-        "- **Evacuation:** move immediately perpendicular to the river channel and climb at "
-        "least 30–50 m above the valley floor; never cross bridges during a surge; follow "
-        "marked high-ground routes rather than the road along the river.\n"
-        "- **Authorities:** install upstream water-level and seismic sensors with SMS/siren "
-        "alerting, keep evacuation routes and assembly points signposted and clear, and "
-        "pre-position rescue caches in downstream settlements."
+        f"**GLOF Hazard Index {idx}/100 — {tier}.** This location ranks above "
+        f"{pct}% of documented GLOF sites worldwide. A {tier.lower()} rating means "
+        f"outburst-flood exposure here is "
+        + ("negligible; standard mountain-river caution is enough."
+           if tier in ("Minimal", "Low")
+           else "material: treat glacier-fed channels as active hazard corridors.")
+        + "\n\n"
+        "Watch for a sudden drop or surge in river level, unusually turbid or "
+        "debris-laden water, and rumbling from upstream. If any appear, move "
+        "immediately away from the channel and climb 30–50 m above the valley "
+        "floor — never cross bridges during a surge.\n\n"
+        f"Preparedness priority for authorities: the weakest factor here is "
+        f"**{worst}** — pair upstream water-level/seismic sensors with SMS-and-siren "
+        f"alerting, and keep signposted evacuation routes to high ground clear."
     )
 
 
@@ -284,7 +303,8 @@ if st.sidebar.button("📡 Fetch ground elevation from DEM"):
         st.session_state["elev"] = float(round(z, 0))
 
 elevation = st.sidebar.number_input(
-    "Ground elevation (m)", min_value=-400.0, max_value=8000.0, step=50.0, key="elev",
+    "Ground elevation (m)", min_value=-400.0, max_value=8000.0, step=10.0, key="elev",
+    help="Ground elevation at your location. Use the 📡 button to pull it from the DEM.",
 )
 radius_km = st.sidebar.slider("Search radius (km)", 5, 300, 50, 5)
 
@@ -516,41 +536,72 @@ with tab_analytics:
 # --------------------------------------------------------------------------- #
 
 with tab_ai:
-    st.subheader("AI-generated disaster advisory")
+    st.subheader("AI Safety Advisory")
 
-    country_region = (geo_result[2] if geo_result else
-                      f'{assessment["nearest_lake_country"]} / {assessment["nearest_lake_region"]}')
+    hz = hazard_index(round(lat, 3), round(lon, 3), float(elevation), float(radius_km))
+    idx, tier = hz["hazard_index"], hz["hazard_tier"]
+    TIER_ICON = {"Minimal": "🟢", "Low": "🟢", "Moderate": "🟠", "High": "🔴", "Severe": "🔴"}
 
-    q = assessment["lake_peak_discharge_m3s"]
-    context = {
-        "country_region": country_region,
-        "nearest_glacier": assessment["nearest_basin"],
-        "runout_distance_km": assessment["nearest_lake_distance_km"],
-        "risk_rating": assessment["risk_score"],
-        "elevation_drop_m": assessment["elevation_drop_H_m"],
-        "peak_discharge_m3s": (round(q, 1) if q is not None else "n/a"),
-        "dam_type": assessment["nearest_lake_dam_type"] or "unknown",
-        "last_outburst": assessment["nearest_lake_last_outburst"] or "none on record",
-    }
+    m1, m2, m3 = st.columns(3)
+    m1.metric("GLOF Hazard Index", f"{idx} / 100", f'{TIER_ICON.get(tier, "")} {tier}',
+              delta_color="off")
+    m2.metric("Nearest documented GLOF", f'{hz["nearest_site_km"]:.1f} km',
+              hz["nearest_lake_region"], delta_color="off")
+    m3.metric("Sites within 50 km", f'{hz["sites_within_50km"]:,}',
+              f'exceeds {hz["exposure_percentile"]:.0f}% of catalogued sites',
+              delta_color="off")
+    st.progress(min(idx / 100.0, 1.0), text=f"{tier} — index {idx}/100")
 
-    cc1, cc2 = st.columns(2)
-    cc1.metric("Risk rating", f'{RISK_COLOR.get(assessment["risk_score"], "")} {assessment["risk_score"]}')
-    cc2.metric("Nearest range", assessment["nearest_basin"])
-
-    prompt = build_advisory_prompt(context)
-    with st.expander("View the generated prompt"):
-        st.code(prompt, language="text")
-
-    if st.button("🧠 Generate advisory", type="primary"):
-        with st.spinner("Contacting LLM…"):
-            advisory = generate_ai_advisory(prompt)
-        st.session_state["advisory"] = advisory
-
-    if "advisory" in st.session_state:
-        st.markdown(st.session_state["advisory"])
+    worst = max(hz["index_components"].items(), key=lambda kv: kv[1])
+    st.markdown("**How the index breaks down** (0–100 per factor)")
+    st.bar_chart(pd.Series(hz["index_components"]).sort_values())
 
     st.caption(
-        "Advisories are decision-support only and must be validated against official "
-        "national disaster-management guidance. Without an LLM API key a built-in "
-        "offline template is shown."
+        f"Nearest documented GLOF site: **{hz['nearest_site_km']} km** away "
+        f"({hz['nearest_lake_name'] or 'unnamed lake'}, "
+        f"{hz['nearest_lake_dam_type'] or 'dam type n/a'} dam, "
+        f"last outburst {hz['nearest_lake_last_outburst'] or '—'}). "
+        f"{hz['sites_within_50km']} documented sites within 50 km. "
+        f"Dominant factor: **{worst[0]}** ({worst[1]}/100)."
+    )
+    st.divider()
+
+    country_region = (geo_result[2] if geo_result else
+                      f'{hz["nearest_lake_country"]} / {hz["nearest_lake_region"]}')
+    q = hz["lake_peak_discharge_m3s"]
+    context = {
+        "country_region": country_region,
+        "nearest_glacier": hz["nearest_basin"],
+        "runout_distance_km": hz["nearest_lake_distance_km"],
+        "hazard_index": idx,
+        "hazard_tier": tier,
+        "exposure_percentile": hz["exposure_percentile"],
+        "inventory_size": hz["inventory_size"],
+        "peak_discharge_m3s": (round(q, 1) if q is not None else "n/a"),
+        "dam_type": hz["nearest_lake_dam_type"] or "unknown",
+        "last_outburst": hz["nearest_lake_last_outburst"] or "none on record",
+        "components": hz["index_components"],
+    }
+
+    adv_key = (round(lat, 2), round(lon, 2), round(float(elevation)), tier)
+    if st.session_state.get("adv_key") != adv_key:
+        with st.spinner("Assessing location and drafting advisory…"):
+            st.session_state["advisory"] = generate_ai_advisory(
+                build_advisory_prompt(context), context
+            )
+        st.session_state["adv_key"] = adv_key
+
+    st.markdown("### Advisory for this location")
+    st.markdown(st.session_state["advisory"])
+    if st.button("↻ Regenerate"):
+        st.session_state.pop("adv_key", None)
+        st.rerun()
+
+    st.caption(
+        "The GLOF Hazard Index (0–100) blends proximity to documented outburst "
+        "sites, local site density, runout mobility (H/L), reported flood magnitude, "
+        "dam-material vulnerability and outburst recency, benchmarked against every "
+        "site in the Zenodo GLOF Database V3.0. Decision-support only — validate "
+        "against official national disaster-management guidance. Without an LLM API "
+        "key a built-in offline assessment is shown."
     )

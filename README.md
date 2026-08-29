@@ -2,9 +2,11 @@
 
 A Streamlit web app for **worldwide** GLOF hazard screening. Enter any latitude /
 longitude (or search a town / address), pick a glaciated region, and the app
-scans a global glacial-lake inventory with an R-tree spatial index to estimate
-breach discharge, runout mobility (`H/L`) and a categorical risk score — then
-drafts an AI emergency advisory tailored to that mountain range.
+scans ~3,060 documented outburst sites with an R-tree spatial index to estimate
+breach discharge and runout mobility (`H/L`). The **AI Safety Advisory** tab then
+computes a quantitative **GLOF Hazard Index (0–100)**, ranks the location against
+every site in the database, and auto-drafts a location-specific advisory from
+that index — no prompt wrangling, no buttons.
 
 ## Project structure
 
@@ -95,6 +97,28 @@ empirical relations:
 * Runout mobility `H/L` = (DEM elevation drop) ÷ (horizontal distance).
 * Returns a `Low` / `Medium` / `High` **Global Risk Score** combining `H/L`,
   proximity and peak breach discharge.
+
+### 4. GLOF Hazard Index — `location_hazard_index(user_lat, user_lon, user_elevation)`
+
+Turns the raw spatial read-out into a single **0–100 index** and a severity tier
+(Minimal / Low / Moderate / High / Severe). Six components, each scored 0–100 and
+weighted:
+
+| Component | Signal |
+|---|---|
+| Proximity | distance to the nearest documented outburst site (exp. decay) |
+| Site density | documented sites within 50 km |
+| Runout mobility | `H/L` of the nearest site above the location |
+| Flood magnitude | reported (or V-scaled) peak discharge, log scale |
+| Dam vulnerability | impounding-dam material (moraine/ice ≫ bedrock) |
+| Recency | years since the most recent recorded outburst there |
+
+A location-only sub-score (the five components that don't need the user's
+elevation) is computed for **every** site in the database once and cached, so the
+app can report where a location falls in that distribution
+(`exceeds X% of catalogued sites`). The **AI Safety Advisory** tab renders the
+index, the component breakdown and an auto-generated 3-paragraph advisory that is
+told to key its authority guidance to the worst-scoring component.
 
 ## Global open data sources
 

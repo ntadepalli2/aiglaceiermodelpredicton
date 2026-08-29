@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime
 from functools import lru_cache
 from typing import Dict, Optional
 
@@ -476,6 +477,171 @@ def assess_global_location_risk(
     }
 
 
+# --------------------------------------------------------------------------- #
+# 4. Location hazard index + global ranking
+# --------------------------------------------------------------------------- #
+
+# Impounding-dam material -> relative breach vulnerability (0-100). More
+# specific keys first: substrings are matched in order.
+DAM_VULNERABILITY = {
+    "supraglacial": 88, "ice volc": 82, "combined": 80, "moraine": 95,
+    "water pocket": 72, "bedrock": 30, "landslide": 62, "glacier": 78,
+    "ice": 85, "rock": 35, "unknown": 60,
+}
+
+# Component weights for the headline index (includes runout mobility, which
+# needs the user's ground elevation) ...
+INDEX_WEIGHTS = {
+    "Proximity": 0.26, "Site density": 0.17, "Runout mobility": 0.20,
+    "Flood magnitude": 0.19, "Dam vulnerability": 0.10, "Recency": 0.08,
+}
+# ... and for the location-only exposure sub-score that is ranked against every
+# documented site (no mobility term - there is no "user" at a catalogue point).
+EXPOSURE_WEIGHTS = {
+    "Proximity": 0.34, "Site density": 0.22, "Flood magnitude": 0.22,
+    "Dam vulnerability": 0.12, "Recency": 0.10,
+}
+RANKING_RADIUS_KM = 50.0
+
+
+def _score_proximity(dist_km):
+    return 100.0 * np.exp(-np.asarray(dist_km, dtype="float64") / 25.0)
+
+
+def _score_density(count):
+    return np.clip(np.asarray(count, dtype="float64") * 4.0, 0.0, 100.0)
+
+
+def _score_magnitude(q_m3s):
+    q = np.clip(np.asarray(q_m3s, dtype="float64"), 1.0, None)
+    return np.clip(100.0 * np.log10(q) / 4.0, 0.0, 100.0)  # 1 -> 0, 1e4 -> 100
+
+
+def _score_mobility(h_l):
+    return np.clip(np.asarray(h_l, dtype="float64") * 300.0, 0.0, 100.0)  # 0.33 -> 100
+
+
+def _score_recency(years_since):
+    ys = np.asarray(years_since, dtype="float64")
+    return np.clip(100.0 - (ys - 10.0) * (90.0 / 190.0), 10.0, 100.0)
+
+
+def _score_dam(dam_type) -> float:
+    if dam_type is None or (isinstance(dam_type, float) and np.isnan(dam_type)):
+        return 60.0
+    key = str(dam_type).lower()
+    for token, val in DAM_VULNERABILITY.items():
+        if token in key:
+            return float(val)
+    return 60.0
+
+
+def hazard_tier(index_value: float) -> str:
+    for lo, name in ((80, "Severe"), (60, "High"), (40, "Moderate"), (20, "Low"), (0, "Minimal")):
+        if index_value >= lo:
+            return name
+    return "Minimal"
+
+
+@lru_cache(maxsize=1)
+def _site_exposure_distribution() -> np.ndarray:
+    """Location-exposure sub-score for every documented GLOF site (for ranking)."""
+    gdf = load_global_glacier_data()
+    lat = gdf["latitude"].to_numpy("float64")
+    lon = gdf["longitude"].to_numpy("float64")
+    q = pd.to_numeric(gdf["peak_discharge_m3s"], errors="coerce").to_numpy("float64")
+    yr = pd.to_numeric(gdf["outburst_year"], errors="coerce").to_numpy("float64")
+    dam_scores = np.array([_score_dam(x) for x in gdf["dam_type"].tolist()])
+    n = len(lat)
+
+    nearest_km = np.full(n, np.nan)
+    density = np.zeros(n)
+    for s in range(0, n, 256):
+        e = min(s + 256, n)
+        d = haversine_m(lat[s:e, None], lon[s:e, None], lat[None, :], lon[None, :]) / 1000.0
+        for i in range(e - s):
+            d[i, s + i] = np.inf
+        nearest_km[s:e] = d.min(axis=1)
+        density[s:e] = (d <= RANKING_RADIUS_KM).sum(axis=1)
+
+    this_year = datetime.now().year
+    years_since = np.where(np.isfinite(yr), this_year - yr, 300.0)
+    w = EXPOSURE_WEIGHTS
+    return (
+        w["Proximity"] * _score_proximity(nearest_km)
+        + w["Site density"] * _score_density(density)
+        + w["Flood magnitude"] * _score_magnitude(np.where(np.isfinite(q), q, 0.0))
+        + w["Dam vulnerability"] * dam_scores
+        + w["Recency"] * _score_recency(years_since)
+    )
+
+
+def location_hazard_index(
+    user_lat: float,
+    user_lon: float,
+    user_elevation: float,
+    search_radius_km: float = 50.0,
+    gdf: Optional[gpd.GeoDataFrame] = None,
+) -> dict:
+    """
+    Quantitative GLOF Hazard Index (0-100) for a location, its severity tier,
+    a component breakdown, and how it ranks against every documented GLOF site.
+
+    Returns the full :func:`assess_global_location_risk` payload plus::
+
+        hazard_index, hazard_tier, index_components,
+        exposure_percentile, exposure_rank, inventory_size,
+        nearest_site_km, sites_within_50km
+    """
+    if gdf is None:
+        gdf = load_global_glacier_data()
+
+    a = assess_global_location_risk(user_lat, user_lon, user_elevation, search_radius_km, gdf)
+
+    d_km = haversine_m(
+        user_lat, user_lon,
+        gdf["latitude"].to_numpy("float64"), gdf["longitude"].to_numpy("float64"),
+    ) / 1000.0
+    nearest_km = float(np.min(d_km))
+    density = int((d_km <= RANKING_RADIUS_KM).sum())
+
+    q = a["lake_peak_discharge_m3s"] or 1.0
+    last = a["nearest_lake_last_outburst"]
+    try:
+        years_since = max(datetime.now().year - int(str(last)[:4]), 0) if last else 300.0
+    except (ValueError, TypeError):
+        years_since = 300.0
+
+    comp = {
+        "Proximity": float(_score_proximity(nearest_km)),
+        "Site density": float(_score_density(density)),
+        "Runout mobility": float(_score_mobility(a["runout_ratio_HL"])),
+        "Flood magnitude": float(_score_magnitude(q)),
+        "Dam vulnerability": _score_dam(a["nearest_lake_dam_type"]),
+        "Recency": float(_score_recency(years_since)),
+    }
+
+    index = sum(INDEX_WEIGHTS[k] * comp[k] for k in INDEX_WEIGHTS)
+    exposure = sum(EXPOSURE_WEIGHTS[k] * comp[k] for k in EXPOSURE_WEIGHTS)
+
+    dist = _site_exposure_distribution()
+    percentile = float((dist < exposure).mean() * 100.0)
+    rank = int((dist >= exposure).sum()) + 1
+
+    return {
+        **a,
+        "hazard_index": round(index, 1),
+        "hazard_tier": hazard_tier(index),
+        "index_components": {k: round(v, 1) for k, v in comp.items()},
+        "exposure_score": round(exposure, 1),
+        "exposure_percentile": round(percentile, 1),
+        "exposure_rank": rank,
+        "inventory_size": int(len(dist)),
+        "nearest_site_km": round(nearest_km, 1),
+        "sites_within_50km": density,
+    }
+
+
 if __name__ == "__main__":  # build + smoke test:  python risk_engine.py [--build]
     import sys
 
@@ -487,6 +653,8 @@ if __name__ == "__main__":  # build + smoke test:  python risk_engine.py [--buil
     print(f"Loaded {len(g):,} documented GLOF sites across {g['basin'].nunique()} basins")
     print(f"  with reported peak discharge: {int(g['discharge_is_reported'].sum()):,}")
     print(f"  with DEM elevation:           {int(g['elevation_m'].notna().sum()):,}")
-    demo = assess_global_location_risk(27.88, 86.87, 4200.0)  # Khumbu, Nepal
-    for k, v in demo.items():
-        print(f"  {k:28s} {v}")
+    demo = location_hazard_index(27.88, 86.87, 4200.0)  # Khumbu, Nepal
+    for k in ("hazard_index", "hazard_tier", "exposure_percentile", "exposure_rank",
+              "inventory_size", "nearest_site_km", "sites_within_50km"):
+        print(f"  {k:22s} {demo[k]}")
+    print("  components:", demo["index_components"])
