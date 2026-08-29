@@ -48,13 +48,37 @@ pip install anthropic
 
 ### 1. Global inventory — `load_global_glacier_data()`
 
-Fetches and caches a worldwide glacial-lake inventory with the schema
-`lake_id, country, latitude, longitude, elevation_m, surface_area_m2`.
-Resolution order: local CSV cache → open remote inventories (Zenodo Global GLOF
-Database / GLIMS) → a deterministic bundled synthetic inventory so the app always
-runs.
+Loads **~3,060 documented historical GLOF sites** from the real
+[Zenodo *Glacier Lake Outburst Flood Database V3.0*](https://doi.org/10.5281/zenodo.7330345)
+(Veh et al. 2023), covering the Andes, European Alps, NW North America, High
+Mountain Asia, Scandinavia, Iceland and Greenland. Each site carries:
+`country, region, lake_name, dam_type, mechanism, latitude, longitude,
+outburst_date, reported_lake_volume_m3, reported_peak_discharge_m3s`.
+
+`build_inventory()` does the one-time heavy lifting:
+
+1. downloads the `.ods` database from Zenodo,
+2. concatenates + cleans the regional sheets,
+3. attaches a **real ground elevation** to every site from the **Copernicus
+   GLO-90 DEM** via the [Open-Meteo elevation API](https://open-meteo.com/en/docs/elevation-api),
+4. back-calculates `surface_area_m2` from the reported pre-outburst volume where
+   one exists (inverse of the V–A scaling law).
+
+The result is cached to `data/global_glof_inventory.csv` (committed to the repo,
+so normal runs are instant and offline-safe). Resolution order: cached CSV →
+fresh build from Zenodo → deterministic synthetic fallback.
+
+Regenerate the cache with:
+
+```bash
+python risk_engine.py --build --force
+```
 
 ### 2. Hydrodynamic scaling
+
+Reported measurements are used where available (755 sites have a measured peak
+discharge, 174 a measured volume). Elsewhere the engine falls back to published
+empirical relations:
 
 | Quantity | Relation |
 |---|---|
@@ -63,24 +87,25 @@ runs.
 
 ### 3. Spatial risk — `assess_global_location_risk(user_lat, user_lon, user_elevation)`
 
-* Builds a **`shapely.strtree.STRtree`** R-tree over all lake points for fast
+* Builds a **`shapely.strtree.STRtree`** R-tree over all site points for fast
   bounding-box candidate selection.
-* Computes great-circle distance to each candidate, identifies the nearest lake
-  **above** the site, and the nearest of the world's principal glaciated basins
-  (Andes, Alps, Himalayas, Karakoram, Central Asia, Alaska/Pacific NW, Patagonia,
-  Iceland, Scandinavia).
-* Runout mobility `H/L` = elevation drop ÷ horizontal distance.
+* Computes great-circle distance to each candidate, identifies the nearest
+  documented site **above** the location, and the nearest of the world's
+  principal glaciated basins.
+* Runout mobility `H/L` = (DEM elevation drop) ÷ (horizontal distance).
 * Returns a `Low` / `Medium` / `High` **Global Risk Score** combining `H/L`,
   proximity and peak breach discharge.
 
 ## Global open data sources
 
-* **Zenodo Global GLOF Inventory** — open global database of 3,000+ historic
-  outburst events across 27 countries.
-* **GLIMS Glacier Database** — NASA/NSIDC-backed global satellite inventory
-  mapping 200,000+ glaciers worldwide.
-* **Copernicus Global DEM (GLO-30, 30 m)** — free worldwide elevation dataset for
-  terrain-drop (`H/L`) calculation anywhere on Earth.
+* **[Zenodo GLOF Database V3.0](https://doi.org/10.5281/zenodo.7330345)** — the
+  live inventory behind this app: ~3,060 documented outburst events with
+  coordinates, dam material, dates and reported magnitudes.
+  *Veh, G. et al. (2023), J. Geophys. Res. Earth Surface.*
+* **[Copernicus GLO-90 DEM](https://open-meteo.com/en/docs/elevation-api)** —
+  free ~90 m global elevation, queried per site for the terrain drop (`H/L`).
+* **GLIMS Glacier Database** — NASA/NSIDC global satellite glacier inventory
+  (200,000+ glaciers); a candidate future layer for lake-growth monitoring.
 
 ## AI technologies in glacier disaster prediction
 

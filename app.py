@@ -54,13 +54,15 @@ REGION_PRESETS = {
     "Central Asia":        (42.20, 78.50, 5),
 }
 
-VOLUME_BINS = [0, 1e5, 1e6, 1e7, np.inf]
-VOLUME_LABELS = ["<0.1 Mm³", "0.1–1 Mm³", "1–10 Mm³", ">10 Mm³"]
-VOLUME_COLORS = {
-    "<0.1 Mm³": "#2c7fb8",
-    "0.1–1 Mm³": "#41b6c4",
-    "1–10 Mm³": "#fe9929",
-    ">10 Mm³": "#d7301f",
+# Reported peak-discharge bands (m³/s) for marker colouring.
+Q_BINS = [0, 100, 500, 2000, np.inf]
+Q_LABELS = ["<100 m³/s", "100–500 m³/s", "500–2000 m³/s", ">2000 m³/s"]
+Q_COLORS = {
+    "<100 m³/s": "#2c7fb8",
+    "100–500 m³/s": "#41b6c4",
+    "500–2000 m³/s": "#fe9929",
+    ">2000 m³/s": "#d7301f",
+    "not reported": "#9e9e9e",
 }
 
 
@@ -68,11 +70,12 @@ VOLUME_COLORS = {
 # Cached resources
 # --------------------------------------------------------------------------- #
 
-@st.cache_data(show_spinner="Loading global glacial-lake inventory…")
+@st.cache_data(show_spinner="Loading global GLOF inventory (Zenodo GLOF DB V3.0)…")
 def get_inventory() -> pd.DataFrame:
     gdf = re.load_global_glacier_data()
     df = pd.DataFrame(gdf.drop(columns="geometry"))
-    df["volume_class"] = pd.cut(df["water_volume_m3"], bins=VOLUME_BINS, labels=VOLUME_LABELS)
+    q_class = pd.cut(df["reported_peak_discharge_m3s"], bins=Q_BINS, labels=Q_LABELS)
+    df["q_class"] = q_class.cat.add_categories("not reported").fillna("not reported")
     return df
 
 
@@ -101,19 +104,21 @@ def build_advisory_prompt(context: dict) -> str:
     ----------
     context : dict with keys
         country_region, nearest_glacier, runout_distance_km, risk_rating,
-        elevation_drop_m, peak_discharge_m3s
+        elevation_drop_m, peak_discharge_m3s, dam_type, last_outburst
     """
     return (
         "You are an emergency-management advisor specialising in glacial lake "
         "outburst floods (GLOFs).\n\n"
-        "Location context:\n"
+        "Location context (nearest documented outburst site, Zenodo GLOF DB V3.0):\n"
         f"- Country / region: {context.get('country_region', 'Unknown')}\n"
-        f"- Nearest glaciated basin / glacier: {context.get('nearest_glacier', 'Unknown')}\n"
-        f"- Distance to nearest high-risk glacial lake: "
+        f"- Nearest glaciated basin: {context.get('nearest_glacier', 'Unknown')}\n"
+        f"- Distance to nearest documented GLOF site: "
         f"{context.get('runout_distance_km', 'n/a')} km\n"
+        f"- Impounding-dam material at that site: {context.get('dam_type', 'unknown')}\n"
+        f"- Most recent recorded outburst there: {context.get('last_outburst', 'n/a')}\n"
         f"- Elevation drop (H) from lake to site: "
         f"{context.get('elevation_drop_m', 'n/a')} m\n"
-        f"- Estimated peak breach discharge: "
+        f"- Peak breach discharge (reported or V-scaled): "
         f"{context.get('peak_discharge_m3s', 'n/a')} m³/s\n"
         f"- Computed risk rating: {context.get('risk_rating', 'Unknown')}\n\n"
         "Produce EXACTLY three concise bullet points, tailored to this specific "
@@ -262,12 +267,32 @@ if geo_result:
 
 lat = st.sidebar.number_input("Latitude", -90.0, 90.0, float(round(default_lat, 4)), 0.001, format="%.4f")
 lon = st.sidebar.number_input("Longitude", -180.0, 180.0, float(round(default_lon, 4)), 0.001, format="%.4f")
-elevation = st.sidebar.number_input("Ground elevation (m)", -400.0, 8000.0, 3000.0, 50.0)
+
+
+@st.cache_data(show_spinner=False)
+def dem_elevation(la: float, lo: float) -> float:
+    try:
+        return float(re._fetch_elevations([la], [lo])[0])
+    except Exception:
+        return float("nan")
+
+if "elev" not in st.session_state:
+    st.session_state["elev"] = 3000.0
+if st.sidebar.button("📡 Fetch ground elevation from DEM"):
+    z = dem_elevation(lat, lon)
+    if np.isfinite(z):
+        st.session_state["elev"] = float(round(z, 0))
+
+elevation = st.sidebar.number_input(
+    "Ground elevation (m)", min_value=-400.0, max_value=8000.0, step=50.0, key="elev",
+)
 radius_km = st.sidebar.slider("Search radius (km)", 5, 300, 50, 5)
 
 st.sidebar.caption(
-    "Data: Zenodo Global GLOF Database · GLIMS Glacier Database · Copernicus GLO-30 DEM. "
-    "Set `OPENROUTER_API_KEY` (or `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) to enable live AI advisories."
+    "Data: [Zenodo GLOF Database V3.0](https://doi.org/10.5281/zenodo.7330345) "
+    "(Veh et al. 2023) · ground elevations from the Copernicus GLO-90 DEM via "
+    "[Open-Meteo](https://open-meteo.com/en/docs/elevation-api). "
+    "Set `OPENROUTER_API_KEY` (or `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) for live AI advisories."
 )
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +310,8 @@ RISK_COLOR = {"Low": "🟢", "Medium": "🟠", "High": "🔴"}
 
 st.title("Global Glacial Lake Outburst Flood (GLOF) Risk Assessment")
 st.markdown(
-    f"**Inventory:** {len(inventory):,} glacial lakes · "
+    f"**Inventory:** {len(inventory):,} documented GLOF sites "
+    f"([Zenodo GLOF Database V3.0](https://doi.org/10.5281/zenodo.7330345)) · "
     f"**Location:** {lat:.3f}, {lon:.3f} · "
     f"**Global Risk Level:** {RISK_COLOR.get(assessment['risk_score'], '')} "
     f"**{assessment['risk_score']}**"
@@ -311,10 +337,12 @@ with tab_map:
         st.metric("Global Risk Level",
                   f'{RISK_COLOR.get(assessment["risk_score"], "")} {assessment["risk_score"]}',
                   f'H/L {assessment["runout_ratio_HL"]}')
-        st.metric("Lakes within radius", assessment["lakes_within_radius"])
+        st.metric("Documented sites within radius", assessment["lakes_within_radius"])
 
-        vol_filter = st.multiselect("Show hazard classes", VOLUME_LABELS, default=VOLUME_LABELS)
-        max_markers = st.slider("Max markers", 200, 5000, 1500, 100)
+        q_filter = st.multiselect(
+            "Show peak-discharge class", list(Q_COLORS), default=list(Q_COLORS)
+        )
+        max_markers = st.slider("Max markers", 200, 5000, 2000, 100)
 
     with c1:
         # Keyless light basemap. CARTO "positron" and Stamen now require an API
@@ -336,25 +364,32 @@ with tab_map:
         ).add_to(fmap)
         folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=True).add_to(fmap)
 
-        view = inventory[inventory["volume_class"].isin(vol_filter)]
-        # Prioritise lakes near the current location, then cap for performance.
+        view = inventory[inventory["q_class"].astype(str).isin(q_filter)]
+        # Prioritise sites near the current location, then cap for performance.
         view = view.assign(
             _d=re.haversine_m(lat, lon, view["latitude"].values, view["longitude"].values)
         ).sort_values("_d").head(max_markers)
 
-        cluster = MarkerCluster(name="Glacial lakes").add_to(fmap)
+        def _fmt(v, unit, dp=0):
+            return f"{v:,.{dp}f} {unit}" if pd.notna(v) else "not reported"
+
+        cluster = MarkerCluster(name="GLOF sites").add_to(fmap)
         for _, r in view.iterrows():
-            color = VOLUME_COLORS.get(str(r["volume_class"]), "#3186cc")
+            color = Q_COLORS.get(str(r["q_class"]), "#9e9e9e")
+            name = r["lake_name"] if pd.notna(r["lake_name"]) else "(unnamed lake)"
             popup = folium.Popup(
                 html=(
-                    f"<b>{r['lake_id']}</b><br>"
-                    f"🏳️ {r['country']} &nbsp;|&nbsp; basin: {r['basin']}<br>"
-                    f"Area: {r['surface_area_m2']:,.0f} m²<br>"
-                    f"Volume: {r['water_volume_m3']:,.0f} m³<br>"
-                    f"Peak discharge: {r['peak_discharge_m3s']:,.1f} m³/s<br>"
-                    f"Elevation: {r['elevation_m']:,.0f} m"
+                    f"<b>{name}</b><br>"
+                    f"🏳️ {r['country']} &nbsp;|&nbsp; {r['region']}<br>"
+                    f"Dam type: {r['dam_type'] if pd.notna(r['dam_type']) else '—'}<br>"
+                    f"Last outburst: {r['outburst_date'] if pd.notna(r['outburst_date']) else '—'}"
+                    + (f" ({r['mechanism']})" if pd.notna(r['mechanism']) else "") + "<br>"
+                    f"Reported peak discharge: {_fmt(r['reported_peak_discharge_m3s'], 'm³/s', 1)}<br>"
+                    f"Reported lake volume: {_fmt(r['reported_lake_volume_m3'], 'm³')}<br>"
+                    f"Ground elevation (DEM): {_fmt(r['elevation_m'], 'm')}<br>"
+                    f"<span style='color:#888'>{r['lake_id']}</span>"
                 ),
-                max_width=260,
+                max_width=280,
             )
             folium.CircleMarker(
                 location=[r["latitude"], r["longitude"]],
@@ -366,7 +401,7 @@ with tab_map:
                 popup=popup,
             ).add_to(cluster)
 
-        # User location + geodesic line to nearest high-risk lake
+        # User location + geodesic line to nearest documented site above it
         folium.Marker(
             [lat, lon],
             tooltip="Selected location",
@@ -374,23 +409,25 @@ with tab_map:
         ).add_to(fmap)
 
         nlat, nlon = assessment["nearest_lake_lat"], assessment["nearest_lake_lon"]
+        near_label = assessment["nearest_lake_name"] or assessment["nearest_lake_id"]
         folium.PolyLine(
             [[lat, lon], [nlat, nlon]],
             color="#d7301f", weight=3, dash_array="8",
-            tooltip=(f'{geodesic((lat, lon), (nlat, nlon)).km:.1f} km to '
-                     f'{assessment["nearest_lake_id"]}'),
+            tooltip=f'{geodesic((lat, lon), (nlat, nlon)).km:.1f} km to {near_label}',
         ).add_to(fmap)
         folium.CircleMarker(
             [nlat, nlon], radius=8, color="#d7301f", fill=True, fill_opacity=1.0,
-            tooltip=f'Nearest high-risk lake: {assessment["nearest_lake_id"]}',
+            tooltip=f'Nearest documented GLOF site: {near_label}',
         ).add_to(fmap)
 
         folium.LayerControl().add_to(fmap)
         st_folium(fmap, height=620, use_container_width=True, returned_objects=[])
 
     st.caption(
-        "Markers coloured by impounded water volume "
-        "(V = 0.035·A¹·²⁹). Red dashed line = geodesic to the nearest lake above the site."
+        "Each marker is a **documented** historical outburst site (Zenodo GLOF "
+        "Database V3.0). Colour = reported peak discharge; grey = magnitude not "
+        "reported. Red dashed line = geodesic to the nearest documented site above "
+        "the selected location."
     )
 
 # --------------------------------------------------------------------------- #
@@ -398,50 +435,79 @@ with tab_map:
 # --------------------------------------------------------------------------- #
 
 with tab_analytics:
-    st.subheader("Nearest-lake hydrodynamics")
+    def _m(v, unit, dp=0):
+        return f"{v:,.{dp}f} {unit}" if v is not None and pd.notna(v) else "not reported"
+
+    st.subheader("Nearest documented GLOF site")
     a, b, c, d = st.columns(4)
-    a.metric("Lake surface area", f'{assessment["lake_surface_area_m2"]:,.0f} m²')
-    b.metric("Water volume V", f'{assessment["lake_water_volume_m3"]:,.0f} m³')
-    c.metric("Peak discharge Q", f'{assessment["lake_peak_discharge_m3s"]:,.1f} m³/s')
+    a.metric("Lake", assessment["nearest_lake_name"] or "(unnamed)")
+    b.metric("Dam type", assessment["nearest_lake_dam_type"] or "—")
+    c.metric("Last recorded outburst", assessment["nearest_lake_last_outburst"] or "—")
     d.metric("Runout ratio H/L", assessment["runout_ratio_HL"])
 
+    e, f, g, h = st.columns(4)
+    e.metric("Surface area (est.)", _m(assessment["lake_surface_area_m2"], "m²"))
+    f.metric("Water volume", _m(assessment["lake_water_volume_m3"], "m³"))
+    g.metric(
+        "Peak discharge Q", _m(assessment["lake_peak_discharge_m3s"], "m³/s", 1),
+        "reported" if assessment["discharge_is_reported"] else "estimated (V-scaling)",
+    )
+    h.metric("Elevation drop H", f'{assessment["elevation_drop_H_m"]} m')
+
+    st.caption(
+        f"{int(inventory['discharge_is_reported'].sum()):,} of {len(inventory):,} sites "
+        f"have a reported peak discharge; {int(inventory['reported_lake_volume_m3'].notna().sum()):,} "
+        f"have a reported pre-outburst volume. Areas/volumes are back-calculated from the "
+        f"V = 0.035·A¹·²⁹ scaling law where not reported."
+    )
     st.divider()
 
     left, right = st.columns(2)
     with left:
-        st.markdown("**Lakes per glaciated basin**")
-        st.bar_chart(inventory["basin"].value_counts())
-        st.markdown("**Hazard-class distribution**")
-        st.bar_chart(inventory["volume_class"].value_counts().reindex(VOLUME_LABELS))
+        st.markdown("**Documented outbursts per region**")
+        st.bar_chart(inventory["region"].value_counts())
+        st.markdown("**Impounding-dam material**")
+        st.bar_chart(inventory["dam_type"].value_counts().head(8))
 
     with right:
-        st.markdown("**Surface area vs. peak discharge (log-log)**")
-        chart_df = inventory[["surface_area_m2", "peak_discharge_m3s", "basin"]].copy()
-        chart_df["log_area"] = np.log10(chart_df["surface_area_m2"].clip(lower=1))
-        chart_df["log_Q"] = np.log10(chart_df["peak_discharge_m3s"].clip(lower=1e-6))
-        st.scatter_chart(chart_df, x="log_area", y="log_Q", color="basin", height=340)
+        st.markdown("**Outbursts by decade**")
+        dec = inventory["outburst_year"].dropna()
+        dec = (dec // 10 * 10).astype(int)
+        dec = dec[dec >= 1850]
+        st.bar_chart(dec.value_counts().sort_index())
+
+        st.markdown("**Reported peak discharge (log10 m³/s)**")
+        q = inventory["reported_peak_discharge_m3s"].dropna()
+        q = np.log10(q[q > 0])
+        hist = np.histogram(q, bins=20)
+        st.bar_chart(pd.Series(hist[0], index=np.round(hist[1][:-1], 2)))
 
     st.divider()
-    st.markdown("**Top 15 highest-volume lakes near the selected location**")
+    st.markdown("**Documented outburst sites near the selected location**")
     near = inventory.assign(
         distance_km=re.haversine_m(lat, lon, inventory["latitude"].values,
                                    inventory["longitude"].values) / 1000.0
     )
     near = near[near["distance_km"] <= radius_km]
-    show_cols = ["lake_id", "country", "basin", "distance_km", "elevation_m",
-                 "surface_area_m2", "water_volume_m3", "peak_discharge_m3s"]
+    show_cols = ["lake_name", "country", "region", "distance_km", "elevation_m",
+                 "dam_type", "outburst_date", "mechanism", "reported_peak_discharge_m3s"]
     if near.empty:
-        st.info("No catalogued lakes within the current search radius — widen it in the sidebar.")
+        st.info("No documented outburst sites within the current search radius — widen it in the sidebar.")
     else:
         st.dataframe(
-            near.sort_values("water_volume_m3", ascending=False)[show_cols].head(15),
+            near.sort_values("distance_km")[show_cols].head(25),
             use_container_width=True, hide_index=True,
+            column_config={
+                "distance_km": st.column_config.NumberColumn("dist (km)", format="%.1f"),
+                "elevation_m": st.column_config.NumberColumn("elev (m)", format="%.0f"),
+                "reported_peak_discharge_m3s": st.column_config.NumberColumn("Qp (m³/s)", format="%.0f"),
+            },
         )
 
     st.download_button(
-        "⬇️ Download filtered inventory (CSV)",
+        "⬇️ Download full inventory (CSV)",
         inventory.to_csv(index=False).encode(),
-        file_name="glacial_lake_inventory.csv",
+        file_name="global_glof_inventory.csv",
         mime="text/csv",
     )
 
@@ -453,15 +519,18 @@ with tab_ai:
     st.subheader("AI-generated disaster advisory")
 
     country_region = (geo_result[2] if geo_result else
-                      f'{assessment["nearest_lake_country"]} / {assessment["nearest_basin"]}')
+                      f'{assessment["nearest_lake_country"]} / {assessment["nearest_lake_region"]}')
 
+    q = assessment["lake_peak_discharge_m3s"]
     context = {
         "country_region": country_region,
         "nearest_glacier": assessment["nearest_basin"],
         "runout_distance_km": assessment["nearest_lake_distance_km"],
         "risk_rating": assessment["risk_score"],
         "elevation_drop_m": assessment["elevation_drop_H_m"],
-        "peak_discharge_m3s": round(assessment["lake_peak_discharge_m3s"], 1),
+        "peak_discharge_m3s": (round(q, 1) if q is not None else "n/a"),
+        "dam_type": assessment["nearest_lake_dam_type"] or "unknown",
+        "last_outburst": assessment["nearest_lake_last_outburst"] or "none on record",
     }
 
     cc1, cc2 = st.columns(2)

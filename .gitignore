@@ -7,3 +7,7 @@ venv/
 .claude/
 data/global_glacial_lakes.csv
 .DS_Store
+
+# Keep the built inventory (data/global_glof_inventory.csv) and the source
+# spreadsheet (data/glofdatabase_V3.ods) in the repo for reproducible,
+# offline-safe runs.

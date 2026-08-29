@@ -7,4 +7,5 @@ pandas
 numpy
 geopy
 requests
+odfpy
 anthropic
