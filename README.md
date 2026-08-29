@@ -1,9 +1,10 @@
 # 🏔️ Global Glacial Lake Outburst Flood (GLOF) Risk Assessment
 
-A Streamlit web app for **worldwide** GLOF hazard screening. Enter any latitude /
-longitude (or search a town / address), pick a glaciated region, and the app
-scans ~3,060 documented outburst sites with an R-tree spatial index to estimate
-breach discharge and runout mobility (`H/L`). The **AI Safety Advisory** tab then
+A Streamlit web app for **worldwide** GLOF hazard screening. **Click any point on
+the map**, search a town, or type coordinates, and the app scans ~3,060
+documented outburst sites with an R-tree spatial index to estimate breach
+discharge and runout mobility (`H/L`). A map click auto-pulls the ground
+elevation from the DEM. The **AI Safety Advisory** tab then
 computes a quantitative **GLOF Hazard Index (0–100)**, ranks the location against
 every site in the database, and auto-drafts a location-specific advisory from
 that index — no prompt wrangling, no buttons.

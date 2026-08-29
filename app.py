@@ -260,10 +260,42 @@ def _offline_advisory(context: dict | None = None) -> str:
 # Sidebar - inputs
 # --------------------------------------------------------------------------- #
 
+@st.cache_data(show_spinner=False)
+def dem_elevation(la: float, lo: float) -> float:
+    try:
+        return float(re._fetch_elevations([la], [lo])[0])
+    except Exception:
+        return float("nan")
+
+
+def _set_location(la: float, lo: float, *, pull_elev: bool = True) -> None:
+    """Point the app at a new location (used by presets, search and map clicks)."""
+    st.session_state["sel_lat"] = float(round(la, 4))
+    st.session_state["sel_lon"] = float(round(lo, 4))
+    st.session_state["_recenter"] = True
+    if pull_elev:
+        z = dem_elevation(round(la, 4), round(lo, 4))
+        if np.isfinite(z):
+            st.session_state["sel_elev"] = float(round(z, 0))
+
+
 st.sidebar.title("🏔️ GLOF Risk Inputs")
 
+# --- one-time defaults -----------------------------------------------------
+for k, v in {"sel_lat": 20.0, "sel_lon": 0.0, "sel_elev": 3000.0}.items():
+    st.session_state.setdefault(k, v)
+
+# --- apply a pending location BEFORE any location widget is instantiated ---
+_pending = st.session_state.pop("_pending_loc", None)
+if _pending:
+    _set_location(*_pending)
+
 region = st.sidebar.selectbox("Quick-select glaciated region", list(REGION_PRESETS))
-preset = REGION_PRESETS[region]
+if region != st.session_state.get("_last_region"):
+    st.session_state["_last_region"] = region
+    if REGION_PRESETS[region]:
+        pa, po, _pz = REGION_PRESETS[region]
+        _set_location(pa, po)
 
 st.sidebar.markdown("### Location")
 mode = st.sidebar.radio("Input mode", ["Coordinates", "City / address search"], horizontal=True)
@@ -275,36 +307,27 @@ if mode == "City / address search":
         geo_result = geocode(query)
         if geo_result:
             st.sidebar.success(f"📍 {geo_result[2][:60]}")
+            if query != st.session_state.get("_last_geo"):
+                st.session_state["_last_geo"] = query
+                _set_location(geo_result[0], geo_result[1])
         else:
             st.sidebar.error("Location not found.")
+else:
+    st.sidebar.caption("💡 Or click any point on the Global Hazard Map.")
 
-default_lat, default_lon, default_zoom = (20.0, 0.0, 2)
-if preset:
-    default_lat, default_lon, default_zoom = preset
-if geo_result:
-    default_lat, default_lon, default_zoom = geo_result[0], geo_result[1], 9
+lat = st.sidebar.number_input(
+    "Latitude", -90.0, 90.0, step=0.001, format="%.4f", key="sel_lat")
+lon = st.sidebar.number_input(
+    "Longitude", -180.0, 180.0, step=0.001, format="%.4f", key="sel_lon")
 
-lat = st.sidebar.number_input("Latitude", -90.0, 90.0, float(round(default_lat, 4)), 0.001, format="%.4f")
-lon = st.sidebar.number_input("Longitude", -180.0, 180.0, float(round(default_lon, 4)), 0.001, format="%.4f")
-
-
-@st.cache_data(show_spinner=False)
-def dem_elevation(la: float, lo: float) -> float:
-    try:
-        return float(re._fetch_elevations([la], [lo])[0])
-    except Exception:
-        return float("nan")
-
-if "elev" not in st.session_state:
-    st.session_state["elev"] = 3000.0
 if st.sidebar.button("📡 Fetch ground elevation from DEM"):
     z = dem_elevation(lat, lon)
     if np.isfinite(z):
-        st.session_state["elev"] = float(round(z, 0))
+        st.session_state["sel_elev"] = float(round(z, 0))
 
 elevation = st.sidebar.number_input(
-    "Ground elevation (m)", min_value=-400.0, max_value=8000.0, step=10.0, key="elev",
-    help="Ground elevation at your location. Use the 📡 button to pull it from the DEM.",
+    "Ground elevation (m)", min_value=-400.0, max_value=8000.0, step=10.0, key="sel_elev",
+    help="Ground elevation at your location. A map click pulls this from the DEM automatically.",
 )
 radius_km = st.sidebar.slider("Search radius (km)", 5, 300, 50, 5)
 
@@ -365,12 +388,17 @@ with tab_map:
         max_markers = st.slider("Max markers", 200, 5000, 2000, 100)
 
     with c1:
+        st.caption("🖱️ **Click anywhere on the map** to assess that point "
+                   "(elevation is pulled from the DEM automatically).")
+        at_default = (round(lat, 3), round(lon, 3)) == (20.0, 0.0)
+        map_zoom = 2 if at_default else 8
+
         # Keyless light basemap. CARTO "positron" and Stamen now require an API
         # key ("API KEY REQUIRED" is watermarked onto their tiles), so use
         # Esri's free World Light Gray Base, with OpenStreetMap as a fallback.
         fmap = folium.Map(
-            location=[default_lat, default_lon],
-            zoom_start=default_zoom,
+            location=[lat, lon],
+            zoom_start=map_zoom,
             tiles=None,
             world_copy_jump=True,
         )
@@ -441,7 +469,24 @@ with tab_map:
         ).add_to(fmap)
 
         folium.LayerControl().add_to(fmap)
-        st_folium(fmap, height=620, use_container_width=True, returned_objects=[])
+        fmap.add_child(folium.LatLngPopup())
+
+        # Follow the selection only right after it changes programmatically,
+        # so manual panning between clicks is preserved.
+        recenter = st.session_state.pop("_recenter", False)
+        st_kwargs = {"center": [lat, lon], "zoom": map_zoom} if recenter else {}
+        map_state = st_folium(
+            fmap, height=620, use_container_width=True,
+            key="hazard_map", returned_objects=["last_clicked"], **st_kwargs,
+        )
+
+    clicked = (map_state or {}).get("last_clicked")
+    if clicked:
+        cll = (round(clicked["lat"], 4), round(((clicked["lng"] + 180) % 360) - 180, 4))
+        if cll != st.session_state.get("_last_click"):
+            st.session_state["_last_click"] = cll
+            st.session_state["_pending_loc"] = cll
+            st.rerun()
 
     st.caption(
         "Each marker is a **documented** historical outburst site (Zenodo GLOF "
