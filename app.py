@@ -19,6 +19,7 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -157,7 +158,7 @@ def _chat_completion(base_url: str, api_key: str, model: str, prompt: str,
     """POST to any OpenAI-compatible /chat/completions endpoint and return the text."""
     payload = {
         "model": model,
-        "max_tokens": int(_secret("LLM_MAX_TOKENS", "800") or 800),
+        "max_tokens": _int_secret("LLM_MAX_TOKENS", 600),
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -176,7 +177,12 @@ def _chat_completion(base_url: str, api_key: str, model: str, prompt: str,
     return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-def generate_ai_advisory(prompt: str, context: dict | None = None) -> str:
+class LLMUnavailable(Exception):
+    """No key configured, budget exhausted, or the provider call failed."""
+
+
+def generate_ai_advisory(prompt: str, context: dict | None = None,
+                         strict: bool = False) -> str:
     """
     Connect to an LLM API client and return the location advisory.
 
@@ -213,7 +219,7 @@ def generate_ai_advisory(prompt: str, context: dict | None = None) -> str:
             client = anthropic.Anthropic(api_key=ant_key)
             msg = client.messages.create(
                 model=_secret("LLM_MODEL", "claude-sonnet-5"),
-                max_tokens=int(_secret("LLM_MAX_TOKENS", "800") or 800),
+                max_tokens=_int_secret("LLM_MAX_TOKENS", 600),
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -226,10 +232,66 @@ def generate_ai_advisory(prompt: str, context: dict | None = None) -> str:
                 _secret("LLM_MODEL", "gpt-4o-mini"), prompt,
             )
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise LLMUnavailable(str(exc)) from exc
         return (f"_LLM request failed ({exc}). Showing offline guidance._\n\n"
                 + _offline_advisory(context))
 
+    if strict:
+        raise LLMUnavailable("no LLM API key configured")
     return _offline_advisory(context)
+
+
+# --------------------------------------------------------------------------- #
+# LLM cost control
+#
+# The advisory is generated automatically, so on a public deployment every
+# visitor would otherwise spend tokens. Three layers keep that bounded:
+#   1. a server-wide cache, so one advisory per ~11 km cell is shared by ALL
+#      visitors rather than regenerated per session;
+#   2. a per-session cap, so one visitor clicking around the map cannot drain
+#      the quota;
+#   3. a server-wide daily cap, after which everyone gets the offline template.
+# Failures and exhaustion raise, so they are never cached in place of a real
+# advisory.
+# --------------------------------------------------------------------------- #
+
+def _int_secret(name: str, default: int) -> int:
+    try:
+        return int(_secret(name, str(default)) or default)
+    except ValueError:
+        return default
+
+
+@st.cache_resource
+def _llm_budget() -> dict:
+    """Server-wide daily call counter, shared across every user session."""
+    return {"day": None, "calls": 0}
+
+
+def _consume_llm_budget() -> bool:
+    cap = _int_secret("LLM_DAILY_CALL_CAP", 250)
+    budget = _llm_budget()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if budget["day"] != today:
+        budget["day"], budget["calls"] = today, 0
+    if budget["calls"] >= cap:
+        return False
+    budget["calls"] += 1
+    return True
+
+
+@st.cache_data(show_spinner=False, max_entries=500, ttl=7 * 24 * 3600)
+def cached_advisory(cache_key: tuple, prompt: str, context: dict) -> str:
+    """One LLM call per distinct location cell, shared across all sessions."""
+    if not _consume_llm_budget():
+        raise LLMUnavailable("daily advisory budget reached")
+    return generate_ai_advisory(prompt, context, strict=True)
+
+
+def advisory_cache_key(lat: float, lon: float, elevation: float, tier: str) -> tuple:
+    """Coarse key: ~11 km cell and 100 m elevation band, so nearby clicks reuse."""
+    return (round(lat, 1), round(lon, 1), round(float(elevation) / 100.0) * 100, tier)
 
 
 def _offline_advisory(context: dict | None = None) -> str:
@@ -632,18 +694,51 @@ with tab_ai:
         "components": hz["index_components"],
     }
 
-    adv_key = (round(lat, 2), round(lon, 2), round(float(elevation)), tier)
+    adv_key = advisory_cache_key(lat, lon, elevation, tier)
+    session_cap = _int_secret("LLM_SESSION_CALL_CAP", 10)
+
     if st.session_state.get("adv_key") != adv_key:
-        with st.spinner("Assessing location and drafting advisory…"):
-            st.session_state["advisory"] = generate_ai_advisory(
-                build_advisory_prompt(context), context
-            )
+        if st.session_state.get("adv_calls", 0) >= session_cap:
+            st.session_state["advisory"] = _offline_advisory(context)
+            st.session_state["advisory_is_ai"] = False
+        else:
+            try:
+                with st.spinner("Assessing location and drafting advisory…"):
+                    st.session_state["advisory"] = cached_advisory(
+                        adv_key, build_advisory_prompt(context), context
+                    )
+                st.session_state["advisory_is_ai"] = True
+            except LLMUnavailable:
+                st.session_state["advisory"] = _offline_advisory(context)
+                st.session_state["advisory_is_ai"] = False
+            st.session_state["adv_calls"] = st.session_state.get("adv_calls", 0) + 1
         st.session_state["adv_key"] = adv_key
 
     st.markdown("### Advisory for this location")
     st.markdown(st.session_state["advisory"])
+    if not st.session_state.get("advisory_is_ai", False):
+        st.info(
+            "Showing the built-in assessment. Live AI advisories are unavailable "
+            "right now (no API key configured, or the shared daily limit for this "
+            "deployment has been reached). The hazard index above is unaffected."
+        )
+    # Regenerate deliberately bypasses the shared cache, so it still costs one
+    # call and is charged against both budgets.
     if st.button("↻ Regenerate"):
-        st.session_state.pop("adv_key", None)
+        if st.session_state.get("adv_calls", 0) >= session_cap or not _consume_llm_budget():
+            st.session_state["advisory"] = _offline_advisory(context)
+            st.session_state["advisory_is_ai"] = False
+        else:
+            try:
+                with st.spinner("Redrafting advisory…"):
+                    st.session_state["advisory"] = generate_ai_advisory(
+                        build_advisory_prompt(context), context, strict=True
+                    )
+                st.session_state["advisory_is_ai"] = True
+            except LLMUnavailable:
+                st.session_state["advisory"] = _offline_advisory(context)
+                st.session_state["advisory_is_ai"] = False
+            st.session_state["adv_calls"] = st.session_state.get("adv_calls", 0) + 1
         st.rerun()
 
     st.caption(
