@@ -73,7 +73,7 @@ Q_COLORS = {
 @st.cache_data(show_spinner="Loading global GLOF inventory (Zenodo GLOF DB V3.0)…")
 def get_inventory() -> pd.DataFrame:
     gdf = re.load_global_glacier_data()
-    df = pd.DataFrame(gdf.drop(columns="geometry"))
+    df = pd.DataFrame(gdf).copy()
     q_class = pd.cut(df["reported_peak_discharge_m3s"], bins=Q_BINS, labels=Q_LABELS)
     df["q_class"] = q_class.cat.add_categories("not reported").fillna("not reported")
     return df

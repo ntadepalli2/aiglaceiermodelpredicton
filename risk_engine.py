@@ -43,7 +43,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-import geopandas as gpd
+import shapely
 from shapely.geometry import Point
 from shapely.strtree import STRtree
 
@@ -246,16 +246,16 @@ def _synthetic_inventory(n: int = 660, seed: int = 42) -> pd.DataFrame:
 
 
 @lru_cache(maxsize=1)
-def load_global_glacier_data() -> gpd.GeoDataFrame:
+def load_global_glacier_data() -> pd.DataFrame:
     """
-    Load the worldwide GLOF inventory as a GeoDataFrame.
+    Load the worldwide GLOF inventory as a DataFrame.
 
     Resolution order:
         1. Cached CSV ``data/global_glof_inventory.csv`` (shipped with the repo).
         2. Freshly built from the Zenodo GLOF Database V3.0 (+ DEM elevations).
         3. Deterministic synthetic inventory (offline fallback).
 
-    Returns a GeoDataFrame (EPSG:4326) with columns::
+    Returns a DataFrame (WGS84 lat/lon columns) with columns::
 
         lake_id country region lake_name dam_type mechanism
         latitude longitude elevation_m outburst_date outburst_year
@@ -298,12 +298,15 @@ def load_global_glacier_data() -> gpd.GeoDataFrame:
     df["discharge_is_reported"] = rep_q > 0
     df["peak_discharge_m3s"] = rep_q.where(rep_q > 0, peak_discharge_from_volume(df["water_volume_m3"]))
 
-    gdf = gpd.GeoDataFrame(
-        df,
-        geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
-        crs="EPSG:4326",
+    return df.reset_index(drop=True)
+
+
+def _point_index(df: pd.DataFrame) -> STRtree:
+    """R-tree over the inventory's (lon, lat) points, in row order."""
+    return STRtree(
+        shapely.points(df["longitude"].to_numpy("float64"),
+                       df["latitude"].to_numpy("float64"))
     )
-    return gdf
 
 
 # --------------------------------------------------------------------------- #
@@ -405,7 +408,7 @@ def assess_global_location_risk(
     user_lon: float,
     user_elevation: float,
     search_radius_km: float = 50.0,
-    gdf: Optional[gpd.GeoDataFrame] = None,
+    gdf: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
     Scan the global GLOF inventory with an R-tree spatial index and assess
@@ -420,7 +423,7 @@ def assess_global_location_risk(
         ``H`` between the hazardous lake and the user.
     search_radius_km : float
         Radius within which sites are considered "local" hazards.
-    gdf : GeoDataFrame, optional
+    gdf : DataFrame, optional
         Pre-loaded inventory; defaults to :func:`load_global_glacier_data`.
 
     Returns
@@ -436,7 +439,7 @@ def assess_global_location_risk(
     # --- R-tree spatial index over site point geometries -------------------
     # Query a generous buffer so we always have real neighbours to rank; fall
     # back to the whole inventory only when nothing is anywhere near.
-    tree = STRtree(list(gdf.geometry.values))
+    tree = _point_index(gdf)
     user_pt = Point(user_lon, user_lat)
 
     query_km = max(search_radius_km, 400.0)
@@ -609,7 +612,7 @@ def location_hazard_index(
     user_lon: float,
     user_elevation: float,
     search_radius_km: float = 50.0,
-    gdf: Optional[gpd.GeoDataFrame] = None,
+    gdf: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
     Quantitative GLOF Hazard Index (0-100) for a location, its severity tier,

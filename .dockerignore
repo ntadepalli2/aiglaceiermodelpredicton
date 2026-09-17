@@ -1,0 +1,10 @@
+.git
+.gitignore
+.claude
+__pycache__
+*.pyc
+.venv
+venv
+.streamlit/secrets.toml
+data/glofdatabase_V3.ods
+README.md

@@ -7,4 +7,10 @@ font = "sans serif"
 
 [server]
 headless = true
-runOnSave = true
+# Hot-reload on file change is a local convenience; keep it off in deployments.
+runOnSave = false
+enableXsrfProtection = true
+enableCORS = false
+
+[browser]
+gatherUsageStats = false

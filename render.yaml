@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: glof-risk-assessment
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      # Set these in the Render dashboard, not here.
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: LLM_MAX_TOKENS
+        sync: false
+      - key: LLM_REASONING_EFFORT
+        sync: false
